@@ -1,0 +1,217 @@
+# teetra/herdr scheduled patch-queue workflow (BL-REQ-731)
+# Installed at .github/workflows/teetra-herdr-patch-queue.yml in teetra/herdr (branch: teetra/main).
+#
+# Product decision (BL-REQ-731-R2):
+#   GitHub Actions only fires `schedule:` triggers from a repository's default branch.
+#   `teetra/main` is the fork's DEFAULT branch so this scheduled workflow fires automatically,
+#   while `master` stays the pure upstream mirror of `herdrdev/herdr`.
+#   Orchestrator repo-setting command (do not run from worker):
+#     gh api --method PATCH repos/teetra/herdr -f default_branch=teetra/main
+#
+# Runs on a GitHub-hosted macOS arm runner (macos-14) so self-hosted fleet runners stay free.
+name: teetra-herdr-patch-queue
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: "Publish a new vX.Y.Z-teetra.N build even if already rebased onto latest upstream tag"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  rebase-test-build-publish:
+    name: Rebase teetra/main onto upstream tag, cargo test, build aarch64-apple-darwin, publish
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      UPSTREAM_REPO: https://github.com/herdrdev/herdr.git
+      FORK_BRANCH: teetra/main
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout teetra/herdr (teetra/main)
+        uses: actions/checkout@v4
+        with:
+          ref: teetra/main
+          fetch-depth: 0
+
+      - name: Install Rust stable toolchain (aarch64-apple-darwin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install Zig 0.16.0 (required by vendored libghostty-vt)
+        uses: vercel-labs/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Configure git identity and fetch upstream release tags
+        run: |
+          set -euo pipefail
+          git config user.name "teetra-patch-queue[bot]"
+          git config user.email "patch-queue@teetra.internal"
+          if ! git remote get-url upstream >/dev/null 2>&1; then
+            git remote add upstream "$UPSTREAM_REPO"
+          fi
+          git fetch --tags upstream
+          git fetch --tags origin "$FORK_BRANCH"
+
+      - name: Validate Teetra-Patch stack, rebase onto latest upstream tag, cargo test, build & publish
+        run: |
+          set -euo pipefail
+          FORK_REPO="${{ github.repository }}"
+          FORK_BRANCH="${FORK_BRANCH:-teetra/main}"
+          LAST_GOOD_SHA="$(git rev-parse "$FORK_BRANCH")"
+          UPSTREAM_TAG="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+          if [ -z "$UPSTREAM_TAG" ]; then
+            echo "No upstream vX.Y.Z tag found" >&2
+            exit 1
+          fi
+          BASE_TAG="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' --exclude '*-*' "$FORK_BRANCH")"
+          echo "Current base: $BASE_TAG | Latest upstream: $UPSTREAM_TAG"
+
+          fail_queue() {
+            local stage="$1"
+            local summary="$2"
+            local detail="${3:-}"
+            git rebase --abort >/dev/null 2>&1 || true
+            git cherry-pick --abort >/dev/null 2>&1 || true
+            git checkout -B "$FORK_BRANCH" "$LAST_GOOD_SHA" >/dev/null 2>&1 || git reset --hard "$LAST_GOOD_SHA"
+            local title="herdr patch queue ${stage} failed on ${UPSTREAM_TAG}: ${summary}"
+            local body
+            body="$(printf 'Stage: `%s`\nUpstream tag: `%s`\nLast good commit preserved: `%s`\nSummary: %s\n\n```\n%s\n```\n' \
+              "$stage" "$UPSTREAM_TAG" "$LAST_GOOD_SHA" "$summary" "${detail:0:1500}")"
+            echo "$title" >&2
+            if [ -n "$detail" ]; then
+              echo "$detail" >&2
+            fi
+            local issue_url=""
+            issue_url="$(gh issue create --repo "$FORK_REPO" --title "$title" --body "$body" || true)"
+            local fp="herdr-queue:${UPSTREAM_TAG}"
+            python3 - "$fp" "$title" "$body" "$issue_url" <<'PY' || true
+          import os, subprocess, sys
+          fp, title, body, issue_url = sys.argv[1:5]
+          links = [issue_url.strip().splitlines()[-1]] if issue_url.strip().startswith("http") else []
+          try:
+              from paddock.incident.store import WorkItemStore
+              WorkItemStore().add_request(
+                  title=title,
+                  type="incident",
+                  product="paddock",
+                  source="herdr-queue",
+                  actor="herdr-queue",
+                  fingerprint=fp,
+                  links=links,
+                  note=body,
+              )
+          except Exception:
+              cli = os.environ.get("PADDOCK_WORK_CLI", "paddock")
+              cmd = [
+                  cli, "work", "add",
+                  "--type", "incident",
+                  "--property", "paddock",
+                  "--source", "herdr-queue",
+                  "--actor", "herdr-queue",
+                  "--title", title,
+                  "--fingerprint", fp,
+                  "--note", body,
+              ]
+              for lk in links:
+                  cmd.extend(["--link", lk])
+              subprocess.run(cmd, check=False)
+          PY
+            exit 1
+          }
+
+          # Validate each patch commit above BASE_TAG carries a unique Teetra-Patch: <name>, config key, and test
+          PATCH_SHAS="$(git rev-list --reverse "${BASE_TAG}..${FORK_BRANCH}")"
+          SEEN_NAMES=" "
+          LAST_PATCH_SHA=""
+          for sha in $PATCH_SHAS; do
+            files="$(git show --pretty=format: --name-only "$sha" | sed '/^$/d')"
+            non_wf_files="$(printf '%s\n' "$files" | grep -Ev '^\.github/workflows/teetra-.*\.yml$' || true)"
+            msg="$(git log -1 --format=%B "$sha")"
+            if [ -z "$non_wf_files" ] && ! printf '%s\n' "$msg" | grep -Eq '^Teetra-Patch:'; then
+              continue
+            fi
+            trailer_line="$(printf '%s\n' "$msg" | grep -Ei '^Teetra-Patch:[[:space:]]*\S+[[:space:]]*$' | tail -n1 || true)"
+            if [ -z "$trailer_line" ]; then
+              fail_queue "validate" "Commit $sha is missing Teetra-Patch: <name> trailer" "$msg"
+            fi
+            pname="$(printf '%s\n' "$trailer_line" | sed -E 's/^[Tt]eetra-[Pp]atch:[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/')"
+            if ! printf '%s\n' "$pname" | grep -Eq '^[a-z0-9][a-z0-9_-]*$'; then
+              fail_queue "validate" "Commit $sha has invalid Teetra-Patch name '$pname'" "$msg"
+            fi
+            case "$SEEN_NAMES" in
+              *" $pname "*)
+                fail_queue "validate" "Commit $sha has duplicate Teetra-Patch name '$pname'" "$msg"
+                ;;
+            esac
+            SEEN_NAMES="${SEEN_NAMES}${pname} "
+            added="$(git show --pretty=format: "$sha" | grep -E '^\+[^+]' || true)"
+            if ! printf '%s\n' "$added" | grep -Eq '#\[\s*(tokio::)?test\b|#\[\s*cfg\(\s*test\s*\)'; then
+              fail_queue "validate" "Commit $sha ($pname) is missing a test in added lines" "$added"
+            fi
+            if ! printf '%s\n' "$added" | grep -Eiq 'config'; then
+              fail_queue "validate" "Commit $sha ($pname) is not gated behind a config key in added lines" "$added"
+            fi
+            LAST_PATCH_SHA="$sha"
+          done
+
+          # Determine next vX.Y.Z-teetra.N tag
+          EXISTING_N="$(git tag -l "${UPSTREAM_TAG}-teetra.*" | sed -E "s|^${UPSTREAM_TAG}-teetra\.([0-9]+)$|\1|" | sort -n | tail -n1 || true)"
+          if [ "$BASE_TAG" = "$UPSTREAM_TAG" ] && [ -n "$EXISTING_N" ] && [ "${{ github.event.inputs.force_publish || 'false' }}" != "true" ]; then
+            EXISTING_TAG="${UPSTREAM_TAG}-teetra.${EXISTING_N}"
+            if [ -z "$LAST_PATCH_SHA" ] || git merge-base --is-ancestor "$LAST_PATCH_SHA" "${EXISTING_TAG}^{commit}" 2>/dev/null; then
+              echo "teetra/main is already on $UPSTREAM_TAG ($EXISTING_TAG); nothing to do."
+              exit 0
+            fi
+          fi
+          NEXT_N=$(( ${EXISTING_N:-0} + 1 ))
+          RELEASE_TAG="${UPSTREAM_TAG}-teetra.${NEXT_N}"
+
+          if [ "$BASE_TAG" != "$UPSTREAM_TAG" ]; then
+            if ! REBASE_OUT="$(git rebase --onto "$UPSTREAM_TAG" "$BASE_TAG" "$FORK_BRANCH" 2>&1)"; then
+              fail_queue "rebase" "rebase of ${FORK_BRANCH} from ${BASE_TAG} onto ${UPSTREAM_TAG} failed" "$REBASE_OUT"
+            fi
+          fi
+
+          export HERDR_BUILD_CHANNEL="teetra"
+          export HERDR_BUILD_ID="${NEXT_N}"
+          if ! TEST_OUT="$(cargo test 2>&1)"; then
+            fail_queue "cargo-test" "cargo test failed on ${UPSTREAM_TAG}" "$TEST_OUT"
+          fi
+
+          if ! BUILD_OUT="$(cargo build --release --target aarch64-apple-darwin 2>&1)"; then
+            fail_queue "cargo-build" "cargo build failed on ${UPSTREAM_TAG}" "$BUILD_OUT"
+          fi
+          BIN="target/aarch64-apple-darwin/release/herdr"
+          if [ ! -f "$BIN" ]; then
+            fail_queue "cargo-build" "built binary missing at $BIN" "$BUILD_OUT"
+          fi
+          VER_OUT="$("$BIN" --version 2>&1 || true)"
+          EXPECTED_VER="herdr ${UPSTREAM_TAG#v}-teetra.${NEXT_N}"
+          if [ "$VER_OUT" != "$EXPECTED_VER" ]; then
+            fail_queue "verify-version" "built binary reported '$VER_OUT', expected '$EXPECTED_VER'" "$VER_OUT"
+          fi
+
+          cp "$BIN" herdr-macos-aarch64
+          chmod 755 herdr-macos-aarch64
+          shasum -a 256 herdr-macos-aarch64 > herdr-macos-aarch64.sha256
+          REBASED_SHA="$(git rev-parse HEAD)"
+          git tag -f "$RELEASE_TAG" "$REBASED_SHA"
+          git push --force-with-lease origin "${REBASED_SHA}:refs/heads/${FORK_BRANCH}"
+          git push -f origin "refs/tags/${RELEASE_TAG}"
+          gh release create "$RELEASE_TAG" \
+            herdr-macos-aarch64 \
+            herdr-macos-aarch64.sha256 \
+            --repo "$FORK_REPO" \
+            --target "$REBASED_SHA" \
+            --title "$RELEASE_TAG" \
+            --notes "Teetra patch stack on ${UPSTREAM_TAG} (${REBASED_SHA})"
