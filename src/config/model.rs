@@ -34,6 +34,7 @@ pub struct UpdateConfig {
     pub channel: UpdateChannelConfig,
     pub version_check: bool,
     pub manifest_check: bool,
+    pub self_update: bool,
 }
 
 impl Default for UpdateConfig {
@@ -42,6 +43,7 @@ impl Default for UpdateConfig {
             channel: default_update_channel(),
             version_check: true,
             manifest_check: true,
+            self_update: false,
         }
     }
 }
@@ -1352,6 +1354,14 @@ manifest_check = false
         assert_eq!(config.update.channel.as_str(), "preview");
         assert!(!config.update.version_check);
         assert!(!config.update.manifest_check);
+    }
+
+    #[test]
+    fn update_self_update_disabled_by_default_and_configurable() {
+        let default_config = Config::default();
+        assert!(!default_config.update.self_update);
+        let enabled: Config = toml::from_str("[update]\nself_update = true\n").unwrap();
+        assert!(enabled.update.self_update);
     }
 
     #[test]

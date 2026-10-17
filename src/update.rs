@@ -2107,6 +2107,9 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    if !crate::config::Config::load().config.update.self_update {
+        return Err("self-update is disabled by [update] self_update = false (managed by pasture-install --herdr)".into());
+    }
     let channel = UpdateChannel::configured();
 
     if is_homebrew_managed_install() {
