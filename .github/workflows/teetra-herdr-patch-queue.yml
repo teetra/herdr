@@ -92,28 +92,20 @@ jobs:
               echo "$detail" >&2
             fi
             local issue_url=""
-            issue_url="$(gh issue create --repo "$FORK_REPO" --title "$title" --body "$body" || true)"
+            issue_url="$(gh issue create --repo "$FORK_REPO" --title "$title" --body "$body")"
             local fp="herdr-queue:${UPSTREAM_TAG}"
-            python3 - "$fp" "$title" "$body" "$issue_url" <<'PY' || true
-          import os, subprocess, sys
+            python3 - "$fp" "$title" "$body" "$issue_url" <<'PY'
+          import fcntl, json, os, subprocess, sys, time
+          from datetime import datetime, timezone
+          from pathlib import Path
+
           fp, title, body, issue_url = sys.argv[1:5]
           links = [issue_url.strip().splitlines()[-1]] if issue_url.strip().startswith("http") else []
-          try:
-              from paddock.incident.store import WorkItemStore
-              WorkItemStore().add_request(
-                  title=title,
-                  type="incident",
-                  product="paddock",
-                  source="herdr-queue",
-                  actor="herdr-queue",
-                  fingerprint=fp,
-                  links=links,
-                  note=body,
-              )
-          except Exception:
-              cli = os.environ.get("PADDOCK_WORK_CLI", "paddock")
+
+          explicit_cli = os.environ.get("PADDOCK_WORK_CLI", "").strip()
+          if explicit_cli:
               cmd = [
-                  cli, "work", "add",
+                  explicit_cli, "work", "add",
                   "--type", "incident",
                   "--property", "paddock",
                   "--source", "herdr-queue",
@@ -124,7 +116,153 @@ jobs:
               ]
               for lk in links:
                   cmd.extend(["--link", lk])
-              subprocess.run(cmd, check=False)
+              subprocess.run(cmd, check=True)
+          else:
+              try:
+                  from paddock.incident.store import WorkItemStore
+                  WorkItemStore().add_request(
+                      title=title,
+                      type="incident",
+                      product="paddock",
+                      source="herdr-queue",
+                      actor="herdr-queue",
+                      fingerprint=fp,
+                      links=links,
+                      note=body,
+                  )
+              except ImportError:
+                  inbox_env = os.environ.get("PADDOCK_INBOX_DIR", "").strip()
+                  if inbox_env:
+                      idir = Path(inbox_env)
+                  else:
+                      ph = os.environ.get("PADDOCK_HOME", "").strip()
+                      idir = (Path(ph) if ph else (Path.home() / ".paddock")) / "inbox"
+                  idir.mkdir(parents=True, exist_ok=True)
+                  lock_fd = os.open(idir / ".incidents.lock", os.O_RDWR | os.O_CREAT, 0o600)
+                  fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                  try:
+                      idx_path = idir / "incidents.json"
+                      log_path = idir / "incidents.jsonl"
+                      arch_path = idir / "incidents_archive.jsonl"
+                      incidents = {}
+                      fp_to_id = {}
+                      if idx_path.is_file():
+                          data = json.loads(idx_path.read_text(encoding="utf-8"))
+                          for rec in data.get("incidents", []):
+                              if isinstance(rec, dict) and rec.get("id"):
+                                  incidents[str(rec["id"])] = rec
+                          fp_to_id = dict(data.get("fingerprints", {}))
+                      elif log_path.is_file():
+                          for ln in log_path.read_text(encoding="utf-8").splitlines():
+                              if ln.strip():
+                                  rec = json.loads(ln)
+                                  if isinstance(rec, dict) and rec.get("id"):
+                                      incidents[str(rec["id"])] = rec
+                                      if rec.get("fingerprint"):
+                                          fp_to_id[str(rec["fingerprint"])] = str(rec["id"])
+                      now = time.time()
+                      now_str = datetime.fromtimestamp(now, timezone.utc).isoformat()
+                      open_item = None
+                      for rec in incidents.values():
+                          if rec.get("fingerprint") == fp and rec.get("state") not in ("resolved", "done") and rec.get("status") not in ("done", "resolved", "closed", "cancelled", "wontfix"):
+                              open_item = rec
+                              break
+                      if open_item is not None:
+                          open_item["count"] = int(open_item.get("count") or 1) + 1
+                          open_item["last_seen"] = now_str
+                          open_item["updated_at"] = now_str
+                          hist = list(open_item.get("history") or [])
+                          st_val = open_item.get("status") or "queued"
+                          hist.append({
+                              "from_status": st_val,
+                              "to_status": st_val,
+                              "actor": "herdr-queue",
+                              "ts": now_str,
+                              "note": f"re-observed (x{open_item['count']}): {body}" if body else f"re-observed (x{open_item['count']})",
+                          })
+                          open_item["history"] = hist
+                          target_rec = open_item
+                      else:
+                          existing_nums = []
+                          all_ids = set(incidents.keys())
+                          if arch_path.is_file():
+                              for ln in arch_path.read_text(encoding="utf-8").splitlines():
+                                  if ln.strip():
+                                      arec = json.loads(ln)
+                                      if isinstance(arec, dict) and arec.get("id"):
+                                          all_ids.add(str(arec["id"]))
+                          for k in all_ids:
+                              if k.startswith("REQ-") and k[4:].isdigit():
+                                  existing_nums.append(int(k[4:]))
+                          item_id = f"REQ-{max(existing_nums, default=0) + 1:02d}"
+                          target_rec = {
+                              "id": item_id,
+                              "product": "paddock",
+                              "fingerprint": fp,
+                              "first_seen": now_str,
+                              "last_seen": now_str,
+                              "count": 1,
+                              "state": "open",
+                              "subject": {"product": "paddock", "route": None, "work": item_id},
+                              "captures": {"before": None, "after": None},
+                              "fix_pr": None,
+                              "resolved_at": None,
+                              "decay_at": None,
+                              "type": "incident",
+                              "title": title,
+                              "attrs": {},
+                              "component": "",
+                              "route": "",
+                              "status": "queued",
+                              "asked_at": now_str,
+                              "asked": now_str,
+                              "source": "herdr-queue",
+                              "priority": None,
+                              "links": links,
+                              "units": links,
+                              "remaining": [],
+                              "blocked_by": None,
+                              "note": body,
+                              "updated_at": now_str,
+                              "history": [{
+                                  "from_status": "",
+                                  "to_status": "queued",
+                                  "actor": "herdr-queue",
+                                  "ts": now_str,
+                                  "note": body or "Initial creation",
+                              }],
+                          }
+                          incidents[item_id] = target_rec
+                          fp_to_id[fp] = item_id
+                      line_bytes = (json.dumps(target_rec, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+                      lfd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                      try:
+                          os.write(lfd, line_bytes)
+                          os.fsync(lfd)
+                      finally:
+                          os.close(lfd)
+                      idx_payload = {
+                          "v": 1,
+                          "updated_at": now,
+                          "fingerprints": fp_to_id,
+                          "incidents": list(incidents.values()),
+                      }
+                      tmp_idx = idx_path.with_name(f".incidents.json.tmp.{os.getpid()}.{time.time_ns()}")
+                      ifd = os.open(tmp_idx, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                      try:
+                          os.write(ifd, json.dumps(idx_payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+                          os.fsync(ifd)
+                      finally:
+                          os.close(ifd)
+                      os.replace(tmp_idx, idx_path)
+                  finally:
+                      fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                      os.close(lock_fd)
+
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as sf:
+                  sf.write(f"## {title}\n\n- Fingerprint: `{fp}`\n- Issue: {issue_url.strip()}\n\n{body}\n")
           PY
             exit 1
           }
@@ -195,10 +333,14 @@ jobs:
           if [ ! -f "$BIN" ]; then
             fail_queue "cargo-build" "built binary missing at $BIN" "$BUILD_OUT"
           fi
-          VER_OUT="$("$BIN" --version 2>&1 || true)"
+          if VER_OUT="$("$BIN" --version 2>&1)"; then
+            VER_RC=0
+          else
+            VER_RC=$?
+          fi
           EXPECTED_VER="herdr ${UPSTREAM_TAG#v}-teetra.${NEXT_N}"
-          if [ "$VER_OUT" != "$EXPECTED_VER" ]; then
-            fail_queue "verify-version" "built binary reported '$VER_OUT', expected '$EXPECTED_VER'" "$VER_OUT"
+          if [ "$VER_RC" -ne 0 ] || [ "$VER_OUT" != "$EXPECTED_VER" ]; then
+            fail_queue "verify-version" "built binary exited $VER_RC and reported '$VER_OUT', expected '$EXPECTED_VER'" "$VER_OUT"
           fi
 
           cp "$BIN" herdr-macos-aarch64
